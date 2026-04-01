@@ -81,7 +81,7 @@ async def to_model_event(span: dict[str, Any]) -> ModelEvent:
     """
     provider = detect_provider(span)
     input_messages = await extract_input_messages(span, provider)
-    output = await extract_output(span)
+    output = await extract_output(span, provider)
     model_name = get_model_name(span) or "unknown"
 
     metadata = span.get("metadata") or {}

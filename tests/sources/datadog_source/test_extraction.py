@@ -1,6 +1,9 @@
 """Tests for Datadog message/output/token extraction."""
 
+import json
+
 import pytest
+from inspect_scout.sources._datadog.content_parse import restructure_anthropic_content
 from inspect_scout.sources._datadog.detection import Provider
 from inspect_scout.sources._datadog.extraction import (
     _extract_system_text,
@@ -485,3 +488,302 @@ class TestExtractSystemText:
         """Return None for empty list content."""
         messages = [{"role": "system", "content": []}]
         assert _extract_system_text(messages) is None
+
+
+class TestRestructureAnthropicContent:
+    """Tests for restructure_anthropic_content content parser."""
+
+    @pytest.mark.parametrize(
+        ("description", "input_content", "expected_types"),
+        [
+            (
+                "tool_result with text",
+                '[tool_result (tool_use_id: toolu_abc)]'
+                '[{"type":"text","text":"result here"}]'
+                "[/tool_result]",
+                [("tool_result", "toolu_abc")],
+            ),
+            (
+                "tool_result with image",
+                '[tool_result (tool_use_id: toolu_img)]'
+                '[{"type":"text","text":"desc"},'
+                '{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}}]'
+                "[/tool_result]",
+                [("tool_result", "toolu_img")],
+            ),
+            (
+                "multiple tool results",
+                '[tool_result (tool_use_id: toolu_1)]'
+                '[{"type":"text","text":"first"}]'
+                "[/tool_result]"
+                " "
+                '[tool_result (tool_use_id: toolu_2)]'
+                '[{"type":"text","text":"second"}]'
+                "[/tool_result]",
+                [("tool_result", "toolu_1"), ("tool_result", "toolu_2")],
+            ),
+        ],
+        ids=["text-result", "image-result", "multiple-results"],
+    )
+    def test_tool_result_parsing(
+        self,
+        description: str,
+        input_content: str,
+        expected_types: list[tuple[str, str]],
+    ) -> None:
+        """Parse tool_result wrappers into structured blocks."""
+        messages = [{"role": "user", "content": input_content}]
+        result = restructure_anthropic_content(messages)
+
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        tool_results = [b for b in content if b["type"] == "tool_result"]
+        assert len(tool_results) == len(expected_types)
+        for block, (expected_type, expected_id) in zip(
+            tool_results, expected_types, strict=True
+        ):
+            assert block["type"] == expected_type
+            assert block["tool_use_id"] == expected_id
+            assert isinstance(block["content"], list)
+
+    def test_tool_result_with_image_has_image_block(self) -> None:
+        """Image data inside tool_result is preserved as an image block."""
+        content = (
+            '[tool_result (tool_use_id: toolu_img)]'
+            '[{"type":"text","text":"screenshot"},'
+            '{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}}]'
+            "[/tool_result]"
+        )
+        messages = [{"role": "user", "content": content}]
+        result = restructure_anthropic_content(messages)
+
+        inner = result[0]["content"][0]["content"]
+        types = [b["type"] for b in inner]
+        assert "image" in types
+
+    def test_raw_json_list(self) -> None:
+        """Parse raw JSON list of typed blocks."""
+        blocks = [
+            {"type": "text", "text": "hello"},
+            {"type": "text", "text": "world"},
+        ]
+        messages = [{"role": "user", "content": json.dumps(blocks)}]
+        result = restructure_anthropic_content(messages)
+
+        assert result[0]["content"] == blocks
+
+    def test_plain_text_unchanged(self) -> None:
+        """Plain text content passes through unchanged."""
+        messages = [{"role": "user", "content": "just plain text"}]
+        result = restructure_anthropic_content(messages)
+
+        assert result[0]["content"] == "just plain text"
+
+    def test_invalid_json_unchanged(self) -> None:
+        """Invalid JSON content passes through unchanged."""
+        messages = [{"role": "user", "content": "{not valid json"}]
+        result = restructure_anthropic_content(messages)
+
+        assert result[0]["content"] == "{not valid json"
+
+    def test_non_string_content_unchanged(self) -> None:
+        """Already-structured content passes through unchanged."""
+        structured = [{"type": "text", "text": "already structured"}]
+        messages = [{"role": "user", "content": structured}]
+        result = restructure_anthropic_content(messages)
+
+        assert result[0]["content"] is structured
+
+    def test_text_between_tool_results_captured(self) -> None:
+        """Text between tool_result blocks is captured as text blocks."""
+        content = (
+            "preamble "
+            '[tool_result (tool_use_id: toolu_1)][{"type":"text","text":"r1"}][/tool_result]'
+            " middle "
+            '[tool_result (tool_use_id: toolu_2)][{"type":"text","text":"r2"}][/tool_result]'
+            " epilogue"
+        )
+        messages = [{"role": "user", "content": content}]
+        result = restructure_anthropic_content(messages)
+
+        blocks = result[0]["content"]
+        text_blocks = [b for b in blocks if b["type"] == "text"]
+        text_values = [b["text"] for b in text_blocks]
+        assert "preamble" in text_values
+        assert "middle" in text_values
+        assert "epilogue" in text_values
+
+
+class TestAnthropicInputMessages:
+    """End-to-end tests for Anthropic provider input message extraction."""
+
+    @pytest.mark.asyncio
+    async def test_stringified_tool_result_produces_tool_message(self) -> None:
+        """Stringified tool_result in user message produces ChatMessageTool."""
+        from inspect_ai.model._chat_message import ChatMessageTool
+
+        span = create_llm_span(
+            model_provider="anthropic",
+            model_name="claude-sonnet-4-20250514",
+            input_messages=[
+                {"role": "user", "content": "What's in this image?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Let me check."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_abc",
+                            "name": "screenshot",
+                            "input": {},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        '[tool_result (tool_use_id: toolu_abc)]'
+                        '[{"type":"text","text":"Screenshot taken"}]'
+                        "[/tool_result]"
+                    ),
+                },
+            ],
+        )
+        messages = await extract_input_messages(span, Provider.ANTHROPIC)
+
+        tool_msgs = [m for m in messages if isinstance(m, ChatMessageTool)]
+        assert len(tool_msgs) >= 1
+        assert tool_msgs[0].tool_call_id == "toolu_abc"
+
+    @pytest.mark.asyncio
+    async def test_stringified_image_in_tool_result_produces_content_image(self) -> None:
+        """Base64 image inside stringified tool_result produces ContentImage."""
+        from inspect_ai.model import ContentImage
+
+        image_data = "iVBORw0KGgoAAAANSUhEUg=="
+        inner = json.dumps(
+            [
+                {"type": "text", "text": "screenshot"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_data,
+                    },
+                },
+            ]
+        )
+        span = create_llm_span(
+            model_provider="anthropic",
+            model_name="claude-sonnet-4-20250514",
+            input_messages=[
+                {"role": "user", "content": "Describe this."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_img",
+                            "name": "capture",
+                            "input": {},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"[tool_result (tool_use_id: toolu_img)]{inner}[/tool_result]"
+                    ),
+                },
+            ],
+        )
+        messages = await extract_input_messages(span, Provider.ANTHROPIC)
+
+        # Find content blocks across all messages.
+        all_content: list[object] = []
+        for m in messages:
+            if isinstance(m.content, list):
+                all_content.extend(m.content)
+
+        image_blocks = [c for c in all_content if isinstance(c, ContentImage)]
+        assert len(image_blocks) >= 1
+
+
+class TestAnthropicOutputExtraction:
+    """End-to-end tests for Anthropic provider output extraction."""
+
+    @pytest.mark.asyncio
+    async def test_structured_tool_use_produces_tool_calls(self) -> None:
+        """Structured Anthropic output with tool_use produces ToolCall objects."""
+        span = create_llm_span(
+            model_provider="anthropic",
+            model_name="claude-sonnet-4-20250514",
+            output_messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Let me search for that."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_search",
+                            "name": "web_search",
+                            "input": {"query": "weather SF"},
+                        },
+                    ],
+                }
+            ],
+        )
+        output = await extract_output(span, Provider.ANTHROPIC)
+
+        msg = output.choices[0].message
+        assert msg.tool_calls is not None
+        assert len(msg.tool_calls) >= 1
+        assert msg.tool_calls[0].function == "web_search"
+        assert msg.tool_calls[0].arguments == {"query": "weather SF"}
+
+    @pytest.mark.asyncio
+    async def test_text_only_anthropic_output(self) -> None:
+        """Text-only Anthropic output works through the Anthropic path."""
+        span = create_llm_span(
+            model_provider="anthropic",
+            model_name="claude-sonnet-4-20250514",
+            output_messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "The answer is 42."},
+                    ],
+                }
+            ],
+        )
+        output = await extract_output(span, Provider.ANTHROPIC)
+
+        msg = output.choices[0].message
+        assert "42" in str(msg.content)
+
+    @pytest.mark.asyncio
+    async def test_string_content_anthropic_output_falls_through(self) -> None:
+        """String content on Anthropic output still produces valid ModelOutput."""
+        span = create_llm_span(
+            model_provider="anthropic",
+            model_name="claude-sonnet-4-20250514",
+            output_messages=[
+                {"role": "assistant", "content": "Simple text response"},
+            ],
+        )
+        output = await extract_output(span, Provider.ANTHROPIC)
+
+        assert output is not None
+        assert output.model == "claude-sonnet-4-20250514"
+
+    @pytest.mark.asyncio
+    async def test_backward_compat_no_provider(self) -> None:
+        """extract_output without provider still works (backward compat)."""
+        span = create_llm_span(
+            output_messages=[{"role": "assistant", "content": "Hello!"}]
+        )
+        output = await extract_output(span)
+
+        assert output is not None
+        assert output.model == "gpt-4o"

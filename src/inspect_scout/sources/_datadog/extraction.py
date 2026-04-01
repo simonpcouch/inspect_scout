@@ -71,12 +71,15 @@ async def _convert_messages(
         try:
             from inspect_ai.model import messages_from_anthropic
 
+            from .content_parse import restructure_anthropic_content
+
             system_text = _extract_system_text(messages)
             non_system = [m for m in messages if m.get("role") != "system"]
+            structured = restructure_anthropic_content(non_system)
             # Datadog messages are list[dict[str, Any]], not the typed
             # dicts the converter expects; runtime format is compatible.
             return await messages_from_anthropic(
-                non_system,  # type: ignore[arg-type]
+                structured,  # type: ignore[arg-type]
                 system_message=system_text,
             )
         except Exception:
@@ -215,13 +218,18 @@ def _simple_message_conversion(
     return result
 
 
-async def extract_output(span: dict[str, Any]) -> ModelOutput:
+async def extract_output(
+    span: dict[str, Any], provider: Provider | None = None
+) -> ModelOutput:
     """Extract output from a Datadog span.
 
-    Reads ``output.messages`` to construct a ModelOutput.
+    Reads ``output.messages`` to construct a ModelOutput. For Anthropic
+    providers, routes through ``model_output_from_anthropic`` to properly
+    handle structured content (tool_use blocks, etc.).
 
     Args:
         span: Datadog span dictionary
+        provider: Detected LLM provider (None falls back to generic path)
 
     Returns:
         ModelOutput object
@@ -232,6 +240,15 @@ async def extract_output(span: dict[str, Any]) -> ModelOutput:
     messages_raw = output_data.get("messages")
     if messages_raw and isinstance(messages_raw, list):
         last_msg = messages_raw[-1] if messages_raw else {}
+
+        if provider == Provider.ANTHROPIC:
+            anthropic_output = await _extract_anthropic_output(last_msg, model_name)
+            if anthropic_output is not None:
+                usage = extract_usage(span)
+                if usage:
+                    anthropic_output.usage = usage
+                return anthropic_output
+
         content = str(last_msg.get("content", ""))
         tool_calls_data = last_msg.get("tool_calls")
 
@@ -270,6 +287,90 @@ async def extract_output(span: dict[str, Any]) -> ModelOutput:
     if usage:
         output.usage = usage
     return output
+
+
+async def _extract_anthropic_output(
+    last_msg: dict[str, Any], model_name: str
+) -> ModelOutput | None:
+    """Try to extract output using the Anthropic converter.
+
+    Handles both structured content (list of blocks) and stringified
+    content that needs parsing.
+
+    Args:
+        last_msg: Last output message dict
+        model_name: Model name for the output
+
+    Returns:
+        ModelOutput or None if Anthropic conversion is not applicable
+    """
+    try:
+        from inspect_ai.model import model_output_from_anthropic
+    except ImportError:
+        return None
+
+    content = last_msg.get("content")
+
+    # Already structured: list of content blocks (e.g. tool_use, text).
+    if isinstance(content, list):
+        try:
+            response_dict = _build_anthropic_response(last_msg, model_name, content)
+            output = await model_output_from_anthropic(response_dict)
+            return output
+        except Exception:
+            logger.debug("model_output_from_anthropic failed on structured content", exc_info=True)
+            return None
+
+    # Stringified content: try to parse back into structured blocks.
+    if isinstance(content, str):
+        from .content_parse import restructure_anthropic_content
+
+        parsed_msgs = restructure_anthropic_content([{"role": "assistant", "content": content}])
+        parsed_content = parsed_msgs[0].get("content")
+        if isinstance(parsed_content, list):
+            try:
+                response_dict = _build_anthropic_response(
+                    last_msg, model_name, parsed_content
+                )
+                output = await model_output_from_anthropic(response_dict)
+                return output
+            except Exception:
+                logger.debug(
+                    "model_output_from_anthropic failed on parsed content", exc_info=True
+                )
+
+    return None
+
+
+def _build_anthropic_response(
+    msg: dict[str, Any], model_name: str, content: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Build an Anthropic API-shaped response dict.
+
+    Args:
+        msg: Original message dict
+        model_name: Model name
+        content: Structured content blocks
+
+    Returns:
+        Dict matching Anthropic Message response shape
+    """
+    stop_reason = "end_turn"
+    if any(
+        isinstance(block, dict) and block.get("type") == "tool_use" for block in content
+    ):
+        stop_reason = "tool_use"
+
+    return {
+        "id": msg.get("id", "msg_datadog"),
+        "type": "message",
+        "role": "assistant",
+        "model": model_name,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
 
 
 def _extract_tool_calls(
