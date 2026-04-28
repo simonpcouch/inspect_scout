@@ -68,14 +68,18 @@ async def _convert_messages(
         List of ChatMessage objects
     """
     if provider == Provider.ANTHROPIC:
+        from .content_parse import restructure_anthropic_content
+
+        # Always restructure Anthropic content first (strips thinking blocks,
+        # base64 images, and parses tool_use/tool_result wrappers) so that
+        # cleanup happens even if the Anthropic converter fails downstream.
+        system_text = _extract_system_text(messages)
+        non_system = [m for m in messages if m.get("role") != "system"]
+        structured = restructure_anthropic_content(non_system)
+
         try:
             from inspect_ai.model import messages_from_anthropic
 
-            from .content_parse import restructure_anthropic_content
-
-            system_text = _extract_system_text(messages)
-            non_system = [m for m in messages if m.get("role") != "system"]
-            structured = restructure_anthropic_content(non_system)
             # Datadog messages are list[dict[str, Any]], not the typed
             # dicts the converter expects; runtime format is compatible.
             return await messages_from_anthropic(
@@ -86,6 +90,9 @@ async def _convert_messages(
             logger.warning(
                 "messages_from_anthropic failed, using OpenAI converter", exc_info=True
             )
+            # Fall through with pre-structured messages so the OpenAI
+            # converter still benefits from thinking/image stripping.
+            messages = structured
 
     if provider == Provider.GOOGLE:
         try:
