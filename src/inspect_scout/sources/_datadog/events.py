@@ -28,7 +28,7 @@ from .detection import (
     is_llm_span,
     is_tool_span,
 )
-from .extraction import extract_input_messages, extract_output, extract_tools
+from .extraction import extract_output, extract_tools
 from .tree import DATETIME_MIN_UTC
 
 
@@ -80,7 +80,6 @@ async def to_model_event(span: dict[str, Any]) -> ModelEvent:
         ModelEvent object
     """
     provider = detect_provider(span)
-    input_messages = await extract_input_messages(span, provider)
     output = await extract_output(span, provider)
     model_name = get_model_name(span) or "unknown"
 
@@ -91,9 +90,11 @@ async def to_model_event(span: dict[str, Any]) -> ModelEvent:
         top_p=metadata.get("top_p"),
     )
 
+    # Skip storing input messages — they duplicate the transcript's
+    # messages column and dominate events_data storage via the dedup pool.
     return ModelEvent(
         model=model_name,
-        input=input_messages,
+        input=[],
         tools=extract_tools(span),
         tool_choice="auto",
         config=config,

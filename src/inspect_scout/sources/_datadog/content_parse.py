@@ -52,6 +52,9 @@ _THINKING_RE = re.compile(
     re.DOTALL,
 )
 
+# Matches inline data URIs (e.g. data:image/png;base64,...) embedded in text.
+_DATA_URI_RE = re.compile(r"data:[^;]{1,60};base64,[A-Za-z0-9+/=]+")
+
 
 def restructure_anthropic_content(
     messages: list[dict[str, Any]],
@@ -111,6 +114,8 @@ def restructure_anthropic_content(
                 continue
 
         # Step 5: Fallthrough — use (possibly thinking-stripped) string.
+        # Also strip inline data URIs from plain-text content.
+        content = _DATA_URI_RE.sub("[inline image stripped]", content)
         result.append({**msg, "content": content})
 
     return result
@@ -122,7 +127,7 @@ def _strip_thinking_blocks(content: str) -> str:
 
 
 def _strip_base64_images(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Replace base64 image blocks with ``[image stripped]`` text blocks."""
+    """Replace base64 image blocks and inline data URIs with placeholders."""
     result = []
     for block in blocks:
         if (
@@ -131,6 +136,9 @@ def _strip_base64_images(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             and block["source"].get("type") == "base64"
         ):
             result.append({"type": "text", "text": "[image stripped]"})
+        elif block.get("type") == "text" and isinstance(block.get("text"), str):
+            cleaned = _DATA_URI_RE.sub("[inline image stripped]", block["text"])
+            result.append({**block, "text": cleaned})
         else:
             result.append(block)
     return result

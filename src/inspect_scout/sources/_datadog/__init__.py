@@ -34,7 +34,7 @@ from .client import (
 )
 from .detection import Provider, detect_provider, get_model_name
 from .events import spans_to_events
-from .extraction import sum_tokens
+from .extraction import extract_input_messages, extract_output, sum_tokens
 from .tree import build_span_tree, flatten_tree_chronological, get_llm_spans
 
 logger = getLogger(__name__)
@@ -315,17 +315,15 @@ async def _build_transcript(
     messages: list[ChatMessage] = []
 
     if llm_spans:
-        model_events = [e for e in events if isinstance(e, ModelEvent)]
-        if model_events:
-            # Pick the model event with the longest input as the best
-            # representation of the conversation. This works well when the
-            # application accumulates full history into each LLM call, but
-            # may select an arbitrary mid-conversation turn for apps using
-            # sliding-window, summarization, or RAG patterns.
-            best_model = max(model_events, key=lambda e: len(e.input))
-            messages = list(best_model.input)
-            if best_model.output and not best_model.output.empty:
-                messages.append(best_model.output.message)
+        # Extract messages from the LLM span with the longest input.
+        # (ModelEvent.input is left empty to avoid duplicating messages
+        # into the events_data dedup pool at storage time.)
+        best_span = max(llm_spans, key=lambda s: len((s.get("input") or {}).get("messages", [])))
+        provider = detect_provider(best_span)
+        messages = await extract_input_messages(best_span, provider)
+        output = await extract_output(best_span, provider)
+        if output and not output.empty:
+            messages.append(output.message)
 
     if not messages:
         root_span = ordered_spans[0]
