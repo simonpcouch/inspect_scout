@@ -16,6 +16,24 @@ Your answer should include an explanation of your assessment. It should include 
 {{ answer_format }}
 """
 
+DEFAULT_TRANSCRIPT_BLOCK_TEMPLATE = """\
+You are an expert in LLM transcript analysis. Here is an LLM transcript you will be analyzing to answer a question:
+
+[BEGIN TRANSCRIPT]
+===================================
+{{ messages }}
+===================================
+[END TRANSCRIPT]"""
+
+DEFAULT_QUESTION_BLOCK_TEMPLATE = """\
+{{ answer_prompt }}
+
+{{ question }}
+
+Your answer should include an explanation of your assessment. It should include the message id's (e.g. '[M2]') to clarify which message(s) you are referring to.
+
+{{ answer_format }}"""
+
 
 ANSWER_FORMAT_PREAMBLE = (
     "The last line of your response should be of the following format:\n\n"

@@ -98,6 +98,8 @@ def single_process_strategy(
         )
 
         scanner_job_deque: deque[ScannerJob] = deque()
+        pending_per_transcript: dict[str, deque[ScannerJob]] = {}
+        transcripts_in_flight: set[str] = set()
         process = psutil.Process()
 
         def _on_batch_status(status: BatchStatus) -> None:
@@ -138,7 +140,9 @@ def single_process_strategy(
                 # USS - Unique Set Size
                 metrics.memory_usage = process.memory_full_info().uss
                 # print(f"{diag_prefix} CPU {metrics.cpu_use}")
-                metrics.buffered_scanner_jobs = len(scanner_job_deque)
+                metrics.buffered_scanner_jobs = len(scanner_job_deque) + sum(
+                    len(q) for q in pending_per_transcript.values()
+                )
                 update_metrics(metrics)
 
         def _choose_next_action() -> Literal["parse", "scan", "wait"]:
@@ -215,9 +219,14 @@ def single_process_strategy(
 
                 # Check success/failure tag
                 if result[0]:
-                    # Success: enqueue scanner jobs
-                    for scanner_job in result[1]:
-                        scanner_job_deque.append(scanner_job)
+                    # Success: enqueue scanner jobs (one at a time per transcript
+                    # to enable prompt caching across scanners)
+                    scanner_jobs = result[1]
+                    if scanner_jobs:
+                        scanner_job_deque.append(scanner_jobs[0])
+                        if len(scanner_jobs) > 1:
+                            tid = scanner_jobs[0].union_transcript.transcript_id
+                            pending_per_transcript[tid] = deque(scanner_jobs[1:])
                 else:
                     # Error: record error results
                     for result_report in result[1]:
@@ -241,6 +250,8 @@ def single_process_strategy(
                 return False
 
             scanner_job = scanner_job_deque.popleft()
+            tid = scanner_job.union_transcript.transcript_id
+            transcripts_in_flight.add(tid)
             exec_start_time = time.time()
             metrics.tasks_scanning += 1
             _update_metrics()
@@ -259,6 +270,13 @@ def single_process_strategy(
                 return True
             finally:
                 metrics.tasks_scanning -= 1
+                # Release transcript lock and promote next queued job
+                transcripts_in_flight.discard(tid)
+                if tid in pending_per_transcript:
+                    next_job = pending_per_transcript[tid].popleft()
+                    if not pending_per_transcript[tid]:
+                        del pending_per_transcript[tid]
+                    scanner_job_deque.append(next_job)
 
         async def _worker_task(
             worker_id: int,
@@ -289,10 +307,11 @@ def single_process_strategy(
                         if await _perform_scan(worker_id):
                             scans_completed += 1
 
-                    # Check if we're done: parse queue exhausted, scanner queue empty, all tasks waiting
+                    # Check if we're done: parse queue exhausted, all queues empty, all tasks waiting
                     if (
                         parse_jobs_exhausted
                         and len(scanner_job_deque) == 0
+                        and len(pending_per_transcript) == 0
                         and metrics.tasks_idle == metrics.task_count - 1
                     ):
                         break
