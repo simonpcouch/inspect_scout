@@ -400,8 +400,8 @@ def _root_duration(root_span: dict[str, Any]) -> float | None:
     duration = root_span.get("duration")
     if duration is not None:
         try:
-            # duration is milliseconds despite the naming convention
-            return int(duration) / 1e3
+            # duration is nanoseconds (Datadog standard)
+            return int(duration) / 1e9
         except (ValueError, TypeError):
             pass
     return None
