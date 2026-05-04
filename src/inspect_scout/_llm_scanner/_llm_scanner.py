@@ -2,8 +2,6 @@ from typing import Any, Awaitable, Callable, Literal, cast, overload
 
 from inspect_ai.model import (
     ChatMessage,
-    ChatMessageUser,
-    ContentText,
     Model,
     get_model,
 )
@@ -25,11 +23,7 @@ from .._transcript.types import Transcript, TranscriptContent
 from ._reducer import default_reducer, is_resultset_answer
 from .answer import Answer, answer_from_argument
 from .generate import generate_answer
-from .prompt import (
-    DEFAULT_QUESTION_BLOCK_TEMPLATE,
-    DEFAULT_SCANNER_TEMPLATE,
-    DEFAULT_TRANSCRIPT_BLOCK_TEMPLATE,
-)
+from .prompt import DEFAULT_SCANNER_TEMPLATE
 from .types import AnswerSpec
 
 
@@ -167,7 +161,8 @@ def llm_scanner(
         A ``Scanner`` function that analyzes Transcript instances and returns
         ``Result`` (single segment) or ``list[Result]`` (multiple segments).
     """
-    use_split_prompt = template is None
+    if template is None:
+        template = DEFAULT_SCANNER_TEMPLATE
     resolved_answer = answer_from_argument(answer)
 
     # resolve retry_refusals
@@ -199,28 +194,17 @@ def llm_scanner(
             compaction=compaction,
             depth=depth,
         ):
-            if use_split_prompt:
-                input_messages = await render_split_prompt(
-                    transcript_template=DEFAULT_TRANSCRIPT_BLOCK_TEMPLATE,
-                    question_template=DEFAULT_QUESTION_BLOCK_TEMPLATE,
-                    template_variables=template_variables,
-                    transcript=transcript,
-                    messages=segment.messages_str,
-                    question=question,
-                    answer=resolved_answer,
-                )
-            else:
-                input_messages = await render_scanner_prompt(
-                    template=template or DEFAULT_SCANNER_TEMPLATE,
-                    template_variables=template_variables,
-                    transcript=transcript,
-                    messages=segment.messages_str,
-                    question=question,
-                    answer=resolved_answer,
-                )
+            prompt = await render_scanner_prompt(
+                template=template,
+                template_variables=template_variables,
+                transcript=transcript,
+                messages=segment.messages_str,
+                question=question,
+                answer=resolved_answer,
+            )
             results.append(
                 await generate_answer(
-                    input_messages,
+                    prompt,
                     answer,
                     model=resolved_model,
                     retry_refusals=retry_refusals,
@@ -278,128 +262,47 @@ async def render_scanner_prompt(
     Returns:
         Rendered prompt string with all variables substituted.
     """
-    resolved_question = (
-        question
-        if isinstance(question, str | None)
-        else await question(transcript)
-    )
-    template_vars = _transcript_template_vars(transcript, template_variables)
+    # resolve variables
+    template_variables = template_variables or {}
+    if callable(template_variables):
+        template_variables = template_variables(transcript)
 
     return (
         Environment(undefined=StrictOnUseUndefined)
         .from_string(template)
         .render(
             messages=messages,
-            question=resolved_question,
+            question=question
+            if isinstance(question, str | None)
+            else await question(transcript),
             answer_prompt=answer.prompt,
             answer_format=answer.format,
-            **template_vars,
+            date=transcript.date,
+            task_set=transcript.task_set,
+            task_id=transcript.task_id,
+            task_repeat=transcript.task_repeat,
+            agent=transcript.agent,
+            agent_args=transcript.agent_args,
+            model=transcript.model,
+            model_options=transcript.model_options,
+            score=transcript.score,
+            success=transcript.success,
+            message_count=transcript.message_count,
+            total_time=transcript.total_time,
+            total_tokens=transcript.total_tokens,
+            error=transcript.error,
+            limit=transcript.limit,
+            metadata=transcript.metadata
+            # backward compatibility for existing templates
+            # TODO: remove this once users have updated
+            | {
+                "task_name": transcript.task_set,
+                "score": transcript.score,
+                "model": transcript.model,
+                "solver": transcript.agent,
+                "error": transcript.error,
+                "limit": transcript.limit,
+            },
+            **template_variables,
         )
     )
-
-
-async def render_split_prompt(
-    *,
-    transcript_template: str,
-    question_template: str,
-    template_variables: dict[str, Any]
-    | Callable[[Transcript], dict[str, Any]]
-    | None = None,
-    transcript: Transcript,
-    messages: str,
-    question: str | Callable[[Transcript], Awaitable[str]] | None,
-    answer: Answer,
-) -> list[ChatMessage]:
-    """Render a two-block user message for prompt caching.
-
-    Produces a single ``ChatMessageUser`` whose ``content`` is a list of two
-    ``ContentText`` blocks: the first contains the transcript (stable across
-    scanners for the same transcript), and the second contains the
-    scanner-specific question.  Anthropic's automatic prompt caching matches
-    on content-block prefixes, so keeping the transcript as a separate leading
-    block allows it to be cached and reused when subsequent scanners share the
-    same transcript prefix.
-
-    Args:
-        transcript_template: Jinja2 template for the transcript block.
-        question_template: Jinja2 template for the question block.
-        template_variables: Additional variables.
-        transcript: Transcript to extract variables from.
-        messages: Formatted conversation messages string.
-        question: Question for the scanner to answer.
-        answer: Answer object containing prompt and format strings.
-
-    Returns:
-        A single-element list containing a ``ChatMessageUser`` with two
-        ``ContentText`` blocks.
-    """
-    resolved_question = (
-        question
-        if isinstance(question, str | None)
-        else await question(transcript)
-    )
-    template_vars = _transcript_template_vars(transcript, template_variables)
-
-    env = Environment(undefined=StrictOnUseUndefined)
-
-    transcript_str = env.from_string(transcript_template).render(
-        messages=messages,
-        **template_vars,
-    )
-    question_str = env.from_string(question_template).render(
-        question=resolved_question,
-        answer_prompt=answer.prompt,
-        answer_format=answer.format,
-        **template_vars,
-    )
-
-    return [
-        ChatMessageUser(
-            content=[
-                ContentText(text=transcript_str),
-                ContentText(text=question_str),
-            ]
-        ),
-    ]
-
-
-def _transcript_template_vars(
-    transcript: Transcript,
-    template_variables: dict[str, Any]
-    | Callable[[Transcript], dict[str, Any]]
-    | None = None,
-) -> dict[str, Any]:
-    """Build the common template variables dict from a transcript."""
-    template_variables = template_variables or {}
-    if callable(template_variables):
-        template_variables = template_variables(transcript)
-
-    return {
-        "date": transcript.date,
-        "task_set": transcript.task_set,
-        "task_id": transcript.task_id,
-        "task_repeat": transcript.task_repeat,
-        "agent": transcript.agent,
-        "agent_args": transcript.agent_args,
-        "model": transcript.model,
-        "model_options": transcript.model_options,
-        "score": transcript.score,
-        "success": transcript.success,
-        "message_count": transcript.message_count,
-        "total_time": transcript.total_time,
-        "total_tokens": transcript.total_tokens,
-        "error": transcript.error,
-        "limit": transcript.limit,
-        "metadata": transcript.metadata
-        # backward compatibility for existing templates
-        # TODO: remove this once users have updated
-        | {
-            "task_name": transcript.task_set,
-            "score": transcript.score,
-            "model": transcript.model,
-            "solver": transcript.agent,
-            "error": transcript.error,
-            "limit": transcript.limit,
-        },
-        **template_variables,
-    }
