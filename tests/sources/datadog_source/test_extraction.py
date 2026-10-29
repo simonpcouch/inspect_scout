@@ -128,6 +128,42 @@ class TestExtractUsage:
         assert usage.output_tokens == 50
         assert usage.total_tokens == 150
 
+    @pytest.mark.parametrize(
+        "cache_metrics, expected_input, expected_read, expected_write",
+        [
+            (
+                {"cache_read_input_tokens": 70, "cache_write_input_tokens": 20},
+                10,
+                70,
+                20,
+            ),
+            ({"cache_read_input_tokens": 70}, 30, 70, None),
+            ({"cache_read_input_tokens": 0, "cache_write_input_tokens": 0}, 100, 0, 0),
+            # Cache counts exceeding reported input clamp to zero.
+            ({"cache_read_input_tokens": 120}, 0, 120, None),
+        ],
+    )
+    def test_cache_usage(
+        self,
+        cache_metrics: dict[str, int],
+        expected_input: int,
+        expected_read: int | None,
+        expected_write: int | None,
+    ) -> None:
+        """Split Datadog's cache-inclusive input into Inspect's uncached input."""
+        span = create_llm_span(input_tokens=100, output_tokens=50)
+        span["metrics"].update(cache_metrics)
+        del span["metrics"]["total_tokens"]
+
+        usage = extract_usage(span)
+
+        assert usage is not None
+        assert usage.input_tokens == expected_input
+        assert usage.input_tokens_cache_read == expected_read
+        assert usage.input_tokens_cache_write == expected_write
+        assert usage.output_tokens == 50
+        assert usage.total_tokens == 150
+
     def test_no_metrics_returns_none(self) -> None:
         """Return None when no token metrics."""
         span = create_llm_span()
