@@ -229,10 +229,11 @@ class TextProgressRich(TextProgress):
             ),
             TextColumn(
                 "[meta]{task.fields[text]}[/meta]",
-                table_column=Column(width=40, no_wrap=True),
+                table_column=Column(ratio=1, no_wrap=True, overflow="ellipsis"),
             ),
             TextColumn(f"[meta]{count_fmt}[/meta]") if self._count else TextColumn(""),
             TimeElapsedColumn(),
+            transient=True,
         )
         self._task_id = self._progress.add_task(
             caption,
