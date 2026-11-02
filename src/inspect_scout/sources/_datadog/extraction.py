@@ -433,15 +433,26 @@ def extract_usage(span: dict[str, Any]) -> ModelUsage | None:
     input_tokens = metrics.get("input_tokens")
     output_tokens = metrics.get("output_tokens")
     total_tokens = metrics.get("total_tokens")
+    cache_read_tokens = metrics.get("cache_read_input_tokens")
+    cache_write_tokens = metrics.get("cache_write_input_tokens")
 
     if input_tokens is not None or output_tokens is not None:
         input_t = int(input_tokens) if input_tokens is not None else 0
         output_t = int(output_tokens) if output_tokens is not None else 0
         total_t = int(total_tokens) if total_tokens is not None else input_t + output_t
+        cache_read_t = int(cache_read_tokens) if cache_read_tokens is not None else None
+        cache_write_t = (
+            int(cache_write_tokens) if cache_write_tokens is not None else None
+        )
+        # Datadog's input_tokens includes cache reads and writes, while
+        # Inspect's input_tokens counts only uncached input.
+        uncached_input_t = max(input_t - (cache_read_t or 0) - (cache_write_t or 0), 0)
         return ModelUsage(
-            input_tokens=input_t,
+            input_tokens=uncached_input_t,
             output_tokens=output_t,
             total_tokens=total_t,
+            input_tokens_cache_read=cache_read_t,
+            input_tokens_cache_write=cache_write_t,
         )
 
     return None

@@ -74,6 +74,97 @@ class TestToModelEvent:
         assert event.output is not None
 
     @pytest.mark.asyncio
+    async def test_anthropic_model_event_preserves_cache_usage(self) -> None:
+        """Anthropic-converted outputs carry Datadog cache usage."""
+        span = create_llm_span(
+            model_provider="anthropic",
+            model_name="claude-sonnet-4-20250514",
+            output_messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_search",
+                            "name": "web_search",
+                            "input": {"query": "weather SF"},
+                        },
+                    ],
+                }
+            ],
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+        )
+        span["metrics"].update(
+            {"cache_read_input_tokens": 70, "cache_write_input_tokens": 20}
+        )
+
+        event = await to_model_event(span)
+
+        # Structured tool calls show the Anthropic converter handled the output.
+        tool_calls = event.output.choices[0].message.tool_calls
+        assert tool_calls is not None
+        assert tool_calls[0].function == "web_search"
+
+        usage = event.output.usage
+        assert usage is not None
+        assert usage.input_tokens == 10
+        assert usage.input_tokens_cache_read == 70
+        assert usage.input_tokens_cache_write == 20
+        assert usage.output_tokens == 50
+        assert usage.total_tokens == 150
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cache_write_tokens", [None, 0])
+    async def test_openai_model_event_preserves_cache_usage(
+        self, cache_write_tokens: int | None
+    ) -> None:
+        """OpenAI-compatible prompt totals include reads, with no billed writes."""
+        span = create_llm_span(
+            model_provider="openai",
+            model_name="gpt-4o",
+            output_messages=[
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_search",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": '{"query": "weather SF"}',
+                            },
+                        }
+                    ],
+                }
+            ],
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+        )
+        # Prism exports prompt_tokens as input and cached_tokens as cache reads.
+        # Baseten writes are not billed; Datadog may omit the zero-valued metric.
+        span["metrics"]["cache_read_input_tokens"] = 70
+        if cache_write_tokens is not None:
+            span["metrics"]["cache_write_input_tokens"] = cache_write_tokens
+
+        event = await to_model_event(span)
+
+        tool_calls = event.output.choices[0].message.tool_calls
+        assert tool_calls is not None
+        assert tool_calls[0].function == "web_search"
+
+        usage = event.output.usage
+        assert usage is not None
+        assert usage.input_tokens == 30
+        assert usage.input_tokens_cache_read == 70
+        assert usage.input_tokens_cache_write == cache_write_tokens
+        assert usage.output_tokens == 50
+        assert usage.total_tokens == 150
+
+    @pytest.mark.asyncio
     async def test_model_event_span_id(self) -> None:
         """ModelEvent should have span_id from parent."""
         span = create_llm_span(parent_id="parent-123")
